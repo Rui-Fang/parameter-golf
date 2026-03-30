@@ -43,7 +43,7 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 600))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 1_048_576))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 1800.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
@@ -1650,7 +1650,7 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
-    requested_grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", "2"))
+    requested_grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", "4"))
     if requested_grad_accum_steps > 0:
         grad_accum_steps = requested_grad_accum_steps
     else:
