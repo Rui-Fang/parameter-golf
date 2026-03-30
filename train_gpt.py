@@ -79,7 +79,7 @@ class Hyperparameters:
     ve_last_n = int(os.environ.get("VE_LAST_N", 2))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 2))
     align_enabled = bool(int(os.environ.get("ALIGN_ENABLED", "1")))
-    align_mode = os.environ.get("ALIGN_MODE", "affine")
+    align_mode = os.environ.get("ALIGN_MODE", "bias")
     align_scale_clamp = float(os.environ.get("ALIGN_SCALE_CLAMP", 0.125))
     align_mix_init = float(os.environ.get("ALIGN_MIX_INIT", 0.0))
     depth_bias_enabled = bool(int(os.environ.get("DEPTH_BIAS_ENABLED", "1")))
