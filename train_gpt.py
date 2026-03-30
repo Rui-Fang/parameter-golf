@@ -51,7 +51,7 @@ class Hyperparameters:
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_front_blocks = int(os.environ.get("NUM_FRONT_BLOCKS", 1))
     num_core_blocks = int(os.environ.get("NUM_CORE_BLOCKS", os.environ.get("NUM_BLOCKS", 3)))
-    num_core_loops = int(os.environ.get("NUM_CORE_LOOPS", os.environ.get("NUM_LOOPS", 1)))
+    num_core_loops = int(os.environ.get("NUM_CORE_LOOPS", os.environ.get("NUM_LOOPS", 3)))
     num_back_blocks = int(os.environ.get("NUM_BACK_BLOCKS", 1))
     num_blocks = num_core_blocks
     num_loops = num_core_loops
@@ -1089,11 +1089,11 @@ class GPT(nn.Module):
         self.smear = SmearGate(model_dim) if use_smear_gate else None
         kv_dim = num_kv_heads * (model_dim // num_heads)
         self.ve = (
-            ValueEmbedding(vocab_size, ve_dim, kv_dim, min(ve_last_n, self.num_core_steps))
+            ValueEmbedding(vocab_size, ve_dim, kv_dim, min(ve_last_n, self.num_core_loops))
             if ve_enabled and ve_last_n > 0
             else None
         )
-        self.ve_last_n = min(ve_last_n, self.num_core_steps)
+        self.ve_last_n = min(ve_last_n, self.num_core_loops)
         self.front_blocks = nn.ModuleList(
             [
                 Block(
@@ -1134,11 +1134,11 @@ class GPT(nn.Module):
             ]
         )
         self.depth_bias = (
-            LoopDepthBias(self.num_core_steps, model_dim) if depth_bias_enabled else None
+            LoopDepthBias(self.num_core_loops, model_dim) if depth_bias_enabled else None
         )
         self.loop_aligner = (
             LoopAligner(
-                self.num_core_steps,
+                self.num_core_loops,
                 model_dim,
                 align_mode,
                 align_scale_clamp,
@@ -1148,27 +1148,27 @@ class GPT(nn.Module):
             else None
         )
         self.cross_loop_carry = (
-            CrossLoopCarry(self.num_core_steps, model_dim, carry_init)
+            CrossLoopCarry(self.num_core_loops, model_dim, carry_init)
             if carry_enabled
             else None
         )
         self.stage_anchors_enabled = stage_anchors_enabled
         self.core_handoff_enabled = core_handoff_enabled
         self.attn_scales = nn.Parameter(
-            torch.ones(self.num_core_steps, model_dim, dtype=torch.float32)
+            torch.ones(self.num_core_loops, model_dim, dtype=torch.float32)
         )
         self.mlp_scales = nn.Parameter(
-            torch.ones(self.num_core_steps, model_dim, dtype=torch.float32)
+            torch.ones(self.num_core_loops, model_dim, dtype=torch.float32)
         )
         self.resid_mixes = nn.Parameter(
             torch.stack(
                 [
                     torch.stack((torch.ones(model_dim), torch.zeros(model_dim)))
-                    for _ in range(self.num_core_steps)
+                    for _ in range(self.num_core_loops)
                 ]
             ).float()
         )
-        self.xsa_last_n = min(xsa_last_n, self.num_core_steps)
+        self.xsa_last_n = min(xsa_last_n, self.num_core_loops)
         self.register_buffer(
             "_boundary_attn_scale",
             torch.ones(model_dim, dtype=torch.float32),
@@ -1238,18 +1238,18 @@ class GPT(nn.Module):
             self._boundary_resid_mix.to(dtype=x.dtype),
         )
 
-    def _core_uses_xsa(self, core_step_idx: int) -> bool:
+    def _core_uses_xsa(self, core_loop_idx: int) -> bool:
         return (
             self.xsa_last_n > 0
-            and core_step_idx >= self.num_core_steps - self.xsa_last_n
+            and core_loop_idx >= self.num_core_loops - self.xsa_last_n
         )
 
-    def _get_core_ve(self, input_ids: Tensor, core_step_idx: int) -> Tensor | None:
+    def _get_core_ve(self, input_ids: Tensor, core_loop_idx: int) -> Tensor | None:
         if self.ve is None or self.ve_last_n <= 0:
             return None
-        if core_step_idx < self.num_core_steps - self.ve_last_n:
+        if core_loop_idx < self.num_core_loops - self.ve_last_n:
             return None
-        ve_idx = core_step_idx - (self.num_core_steps - self.ve_last_n)
+        ve_idx = core_loop_idx - (self.num_core_loops - self.ve_last_n)
         return self.ve(input_ids, ve_idx)
 
     def _core_handoff_start(self) -> int:
@@ -1257,26 +1257,20 @@ class GPT(nn.Module):
             return self.num_core_steps
         return max(1, self.num_core_steps // 2)
 
-    def _iter_core_blocks(self):
-        for core_loop_idx in range(self.num_core_loops):
-            for core_block_idx, block in enumerate(self.core_blocks):
-                core_step_idx = core_loop_idx * self.num_core_blocks + core_block_idx
-                yield core_loop_idx, core_block_idx, core_step_idx, block
-
     def _apply_boundary_block(self, block: Block, x: Tensor, x0: Tensor) -> Tensor:
         attn_scale, mlp_scale, resid_mix = self._boundary_controls(x)
         block.attn.use_xsa = False
         return block(x, x0, attn_scale, mlp_scale, resid_mix)
 
     def _prepare_core_input(
-        self, x: Tensor, prev_state: Tensor | None, core_step_idx: int
+        self, x: Tensor, prev_state: Tensor | None, core_loop_idx: int
     ) -> Tensor:
         if self.depth_bias is not None:
-            x = self.depth_bias(x, core_step_idx)
+            x = self.depth_bias(x, core_loop_idx)
         if self.loop_aligner is not None:
-            x = self.loop_aligner(x, core_step_idx)
+            x = self.loop_aligner(x, core_loop_idx)
         if self.cross_loop_carry is not None:
-            x = self.cross_loop_carry(x, prev_state, core_step_idx)
+            x = self.cross_loop_carry(x, prev_state, core_loop_idx)
         return x
 
     def collect_loop_stats(self, input_ids: Tensor) -> dict[str, object]:
@@ -1292,36 +1286,45 @@ class GPT(nn.Module):
         late_core_anchor = core_anchor
         handoff_start = self._core_handoff_start()
 
-        prev_state = None
+        prev_block_states: list[Tensor | None] = [None] * self.num_core_blocks
         loop_stats: list[dict[str, float]] = []
-        for _core_loop_idx, _core_block_idx, core_step_idx, block in self._iter_core_blocks():
-            pre_align = summarize_activation_stats(x)
-            x_pre_block = self._prepare_core_input(x, prev_state, core_step_idx)
-            pre_block = summarize_activation_stats(x_pre_block)
-            block.attn.use_xsa = self._core_uses_xsa(core_step_idx)
-            active_anchor = (
-                late_core_anchor if core_step_idx >= handoff_start else core_anchor
-            )
-            x = block(
-                x_pre_block,
-                active_anchor,
-                self.attn_scales[core_step_idx],
-                self.mlp_scales[core_step_idx],
-                self.resid_mixes[core_step_idx],
-                v_embed=self._get_core_ve(input_ids, core_step_idx),
-            )
-            prev_state = x
-            if core_step_idx + 1 == handoff_start:
-                late_core_anchor = x
-            loop_stats.append(
-                {
-                    "loop_idx": float(core_step_idx),
-                    "pre_align_rms": pre_align["rms"],
-                    "pre_align_p99": pre_align["p99"],
-                    "pre_block_rms": pre_block["rms"],
-                    "pre_block_p99": pre_block["p99"],
-                }
-            )
+        for core_loop_idx in range(self.num_core_loops):
+            next_block_states: list[Tensor | None] = [None] * self.num_core_blocks
+            loop_v_embed = self._get_core_ve(input_ids, core_loop_idx)
+            loop_uses_xsa = self._core_uses_xsa(core_loop_idx)
+            for core_block_idx, block in enumerate(self.core_blocks):
+                core_step_idx = core_loop_idx * self.num_core_blocks + core_block_idx
+                prev_state = prev_block_states[core_block_idx]
+                pre_align = summarize_activation_stats(x)
+                x_pre_block = self._prepare_core_input(x, prev_state, core_loop_idx)
+                pre_block = summarize_activation_stats(x_pre_block)
+                block.attn.use_xsa = loop_uses_xsa
+                active_anchor = (
+                    late_core_anchor if core_step_idx >= handoff_start else core_anchor
+                )
+                x = block(
+                    x_pre_block,
+                    active_anchor,
+                    self.attn_scales[core_loop_idx],
+                    self.mlp_scales[core_loop_idx],
+                    self.resid_mixes[core_loop_idx],
+                    v_embed=loop_v_embed,
+                )
+                next_block_states[core_block_idx] = x
+                if core_step_idx + 1 == handoff_start:
+                    late_core_anchor = x
+                loop_stats.append(
+                    {
+                        "loop_idx": float(core_loop_idx),
+                        "block_idx": float(core_block_idx),
+                        "step_idx": float(core_step_idx),
+                        "pre_align_rms": pre_align["rms"],
+                        "pre_align_p99": pre_align["p99"],
+                        "pre_block_rms": pre_block["rms"],
+                        "pre_block_p99": pre_block["p99"],
+                    }
+                )
+            prev_block_states = next_block_states
 
         if not loop_stats:
             return {
@@ -1357,28 +1360,35 @@ class GPT(nn.Module):
         late_core_anchor = core_anchor
         handoff_start = self._core_handoff_start()
 
-        prev_state = None
-        for _core_loop_idx, _core_block_idx, core_step_idx, block in self._iter_core_blocks():
-            qd = lora.q_loras[core_step_idx] if lora else None
-            vd = lora.v_loras[core_step_idx] if lora else None
-            x = self._prepare_core_input(x, prev_state, core_step_idx)
-            block.attn.use_xsa = self._core_uses_xsa(core_step_idx)
-            active_anchor = (
-                late_core_anchor if core_step_idx >= handoff_start else core_anchor
-            )
-            x = block(
-                x,
-                active_anchor,
-                self.attn_scales[core_step_idx],
-                self.mlp_scales[core_step_idx],
-                self.resid_mixes[core_step_idx],
-                qd,
-                vd,
-                v_embed=self._get_core_ve(input_ids, core_step_idx),
-            )
-            prev_state = x
-            if core_step_idx + 1 == handoff_start:
-                late_core_anchor = x
+        prev_block_states: list[Tensor | None] = [None] * self.num_core_blocks
+        for core_loop_idx in range(self.num_core_loops):
+            next_block_states: list[Tensor | None] = [None] * self.num_core_blocks
+            loop_v_embed = self._get_core_ve(input_ids, core_loop_idx)
+            loop_uses_xsa = self._core_uses_xsa(core_loop_idx)
+            for core_block_idx, block in enumerate(self.core_blocks):
+                core_step_idx = core_loop_idx * self.num_core_blocks + core_block_idx
+                qd = lora.q_loras[core_step_idx] if lora else None
+                vd = lora.v_loras[core_step_idx] if lora else None
+                prev_state = prev_block_states[core_block_idx]
+                x = self._prepare_core_input(x, prev_state, core_loop_idx)
+                block.attn.use_xsa = loop_uses_xsa
+                active_anchor = (
+                    late_core_anchor if core_step_idx >= handoff_start else core_anchor
+                )
+                x = block(
+                    x,
+                    active_anchor,
+                    self.attn_scales[core_loop_idx],
+                    self.mlp_scales[core_loop_idx],
+                    self.resid_mixes[core_loop_idx],
+                    qd,
+                    vd,
+                    v_embed=loop_v_embed,
+                )
+                next_block_states[core_block_idx] = x
+                if core_step_idx + 1 == handoff_start:
+                    late_core_anchor = x
+            prev_block_states = next_block_states
 
         back_anchor = x if self.stage_anchors_enabled else embed_anchor
         for block in self.back_blocks:
@@ -1410,24 +1420,31 @@ class GPT(nn.Module):
         late_core_anchor = core_anchor
         handoff_start = self._core_handoff_start()
 
-        prev_state = None
-        for _core_loop_idx, _core_block_idx, core_step_idx, block in self._iter_core_blocks():
-            x = self._prepare_core_input(x, prev_state, core_step_idx)
-            block.attn.use_xsa = self._core_uses_xsa(core_step_idx)
-            active_anchor = (
-                late_core_anchor if core_step_idx >= handoff_start else core_anchor
-            )
-            x = block(
-                x,
-                active_anchor,
-                self.attn_scales[core_step_idx],
-                self.mlp_scales[core_step_idx],
-                self.resid_mixes[core_step_idx],
-                v_embed=self._get_core_ve(input_ids, core_step_idx),
-            )
-            prev_state = x
-            if core_step_idx + 1 == handoff_start:
-                late_core_anchor = x
+        prev_block_states: list[Tensor | None] = [None] * self.num_core_blocks
+        for core_loop_idx in range(self.num_core_loops):
+            next_block_states: list[Tensor | None] = [None] * self.num_core_blocks
+            loop_v_embed = self._get_core_ve(input_ids, core_loop_idx)
+            loop_uses_xsa = self._core_uses_xsa(core_loop_idx)
+            for core_block_idx, block in enumerate(self.core_blocks):
+                core_step_idx = core_loop_idx * self.num_core_blocks + core_block_idx
+                prev_state = prev_block_states[core_block_idx]
+                x = self._prepare_core_input(x, prev_state, core_loop_idx)
+                block.attn.use_xsa = loop_uses_xsa
+                active_anchor = (
+                    late_core_anchor if core_step_idx >= handoff_start else core_anchor
+                )
+                x = block(
+                    x,
+                    active_anchor,
+                    self.attn_scales[core_loop_idx],
+                    self.mlp_scales[core_loop_idx],
+                    self.resid_mixes[core_loop_idx],
+                    v_embed=loop_v_embed,
+                )
+                next_block_states[core_block_idx] = x
+                if core_step_idx + 1 == handoff_start:
+                    late_core_anchor = x
+            prev_block_states = next_block_states
 
         back_anchor = x if self.stage_anchors_enabled else embed_anchor
         for block in self.back_blocks:
@@ -2017,7 +2034,7 @@ def main() -> None:
     )
     log0(
         f"architecture:planc front_blocks:{args.num_front_blocks} core_blocks:{args.num_core_blocks} core_loops:{args.num_core_loops} core_steps:{base_model.num_core_steps} back_blocks:{args.num_back_blocks} "
-        f"core_block_params:{core_block_params} boundary_block_params:{boundary_block_params} per_core_step_params:{loop_params} align_params:{align_params}"
+        f"core_block_params:{core_block_params} boundary_block_params:{boundary_block_params} per_loop_params:{loop_params} align_params:{align_params}"
     )
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -2079,7 +2096,7 @@ def main() -> None:
             return
         stats = base_model.collect_loop_stats(input_ids[:1])
         loop_pairs = " ".join(
-            f"L{int(item['loop_idx'])}:{item['pre_align_rms']:.4f}->{item['pre_block_rms']:.4f}/{item['pre_align_p99']:.4f}->{item['pre_block_p99']:.4f}"
+            f"L{int(item['loop_idx'])}B{int(item['block_idx'])}:{item['pre_align_rms']:.4f}->{item['pre_block_rms']:.4f}/{item['pre_align_p99']:.4f}->{item['pre_block_p99']:.4f}"
             for item in stats["loops"]
         )
         log0(
