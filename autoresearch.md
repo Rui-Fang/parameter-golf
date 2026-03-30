@@ -102,7 +102,8 @@ Notes:
 - Use time-first run ids so logs sort chronologically, for example `20260331_014700_stageanchors`.
 - `train_gpt.py` already writes its own structured log to `logs/<RUN_ID>.txt`.
 - Redirecting stdout and stderr to `logs/<run_id>.driver.log` avoids flooding the agent context.
-- The current built-in single-GPU defaults are: `MAX_WALLCLOCK_SECONDS=1800`, `TRAIN_BATCH_TOKENS=1048576`, `GRAD_ACCUM_STEPS=2`, `NUM_FRONT_BLOCKS=1`, `NUM_CORE_BLOCKS=3`, `NUM_CORE_LOOPS=3`, `NUM_BACK_BLOCKS=1`, `QAT_ENABLED=1`, `QAT_MODE=shared_early`, `VE_LAST_N=2`, `XSA_LAST_N=2`, `COLLECT_LOOP_STATS=1`.
+- The current built-in single-GPU defaults are: `MAX_WALLCLOCK_SECONDS=1800`, `TRAIN_BATCH_TOKENS=1048576`, `GRAD_ACCUM_STEPS=2`, `NUM_FRONT_BLOCKS=1`, `NUM_CORE_BLOCKS=3`, `NUM_CORE_LOOPS=1`, `NUM_BACK_BLOCKS=1`, `QAT_ENABLED=1`, `QAT_MODE=shared_early`, `VE_LAST_N=2`, `XSA_LAST_N=2`, `COLLECT_LOOP_STATS=1`.
+- `NUM_CORE_LOOPS` now means the number of full sweeps over the shared core block bank. Effective core depth is `NUM_CORE_BLOCKS * NUM_CORE_LOOPS`.
 
 Baseline command example:
 

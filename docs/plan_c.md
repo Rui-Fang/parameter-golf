@@ -107,7 +107,7 @@ embed + bigram + smear
 - `num_core_loops = 5`
 - `num_back_blocks = 1`
 
-这对应总共 7 次主计算，仍与 #927 的 wallclock 量级接近，但语义改成：
+若 `num_core_loops` 解释为“完整扫过 shared core block bank 的轮数”，则在 `num_core_blocks = 2`、`num_core_loops = 5` 时，core 的 effective depth 是 `10`，总主计算是 `1 + 10 + 1 = 12`。这比最初的 7-step 草案更深，因此后续 wallclock 配置应按 effective depth 重新估算。
 
 - 第 0 步：进入 recurrent state
 - 中间 5 步：共享 core 迭代 refinement
@@ -155,6 +155,7 @@ num_back_blocks = int(os.environ.get("NUM_BACK_BLOCKS", 1))
 
 - 如果只设置 `NUM_LOOPS`，则自动推导为 `NUM_CORE_LOOPS`
 - 若显式设置 `NUM_CORE_LOOPS`，则以新字段为准
+- `NUM_CORE_LOOPS` 表示完整 sweep 次数，不是单个 core step 数；effective core depth 为 `NUM_CORE_BLOCKS * NUM_CORE_LOOPS`
 
 ### alignment 参数
 
