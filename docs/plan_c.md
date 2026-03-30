@@ -384,6 +384,28 @@ logits = self._logits(x)
 
 建议先用常数控制，减少变量数。
 
+### Note: 为什么不保留 core handoff anchor
+
+曾考虑过一种额外设计：
+
+- core 前半段围绕 front boundary 之后的 `core_anchor`
+- 在 core 中途记录一次新的 handoff anchor
+- core 后半段改为围绕 handoff anchor 工作
+
+这个想法的直觉是把 shared core 再切成“早期 refinement”和“晚期 refinement”两段，进一步减轻单一 anchor 的职责负担。
+
+但在把 `num_core_loops` 纠正为“完整 sweep 次数”之后，这个设计不再适合作为 Plan C 默认主线，原因有两个：
+
+1. 它天然更像 effective-step 控制，而不是 loopwise 控制。若 handoff 发生在一个 sweep 中间，就会重新引入按 step 切分语义，与 Plan C 想强调的 per-loop control plane 冲突。
+2. 它会让 shared core 同时承担“跨 loop recurrence”和“中途阶段切换”两种机制，增加解释难度，不利于先把真正的 loop / carry / late VE / late XSA 语义跑通。
+
+因此当前实现选择：
+
+- 保留 `stage_anchors`，即 boundary/core/back 之间的阶段锚点
+- 不在 core 内部再加入额外 handoff anchor
+
+如果未来要重新探索 handoff，应明确把它设计成 loop-boundary 上的切换，而不是 sweep 内部的 step-level 切换。
+
 ---
 
 ## 5.6 XSA 与 VE 的重解释
