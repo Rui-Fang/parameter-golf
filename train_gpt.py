@@ -86,6 +86,7 @@ class Hyperparameters:
     carry_enabled = bool(int(os.environ.get("CARRY_ENABLED", "0")))
     carry_init = float(os.environ.get("CARRY_INIT", 0.05))
     stage_anchors_enabled = bool(int(os.environ.get("STAGE_ANCHORS_ENABLED", "1")))
+    core_handoff_enabled = bool(int(os.environ.get("CORE_HANDOFF_ENABLED", "1")))
     collect_loop_stats = bool(int(os.environ.get("COLLECT_LOOP_STATS", "1")))
     loop_stats_every = int(os.environ.get("LOOP_STATS_EVERY", 200))
 
@@ -1057,6 +1058,7 @@ class GPT(nn.Module):
         carry_enabled: bool = True,
         carry_init: float = 0.05,
         stage_anchors_enabled: bool = True,
+        core_handoff_enabled: bool = True,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1150,6 +1152,7 @@ class GPT(nn.Module):
             else None
         )
         self.stage_anchors_enabled = stage_anchors_enabled
+        self.core_handoff_enabled = core_handoff_enabled
         self.attn_scales = nn.Parameter(
             torch.ones(num_core_loops, model_dim, dtype=torch.float32)
         )
@@ -1245,6 +1248,11 @@ class GPT(nn.Module):
         ve_idx = loop_idx - (self.num_core_loops - self.ve_last_n)
         return self.ve(input_ids, ve_idx)
 
+    def _core_handoff_start(self) -> int:
+        if not self.core_handoff_enabled or self.num_core_loops < 3:
+            return self.num_core_loops
+        return max(1, self.num_core_loops // 2)
+
     def _apply_boundary_block(self, block: Block, x: Tensor, x0: Tensor) -> Tensor:
         attn_scale, mlp_scale, resid_mix = self._boundary_controls(x)
         block.attn.use_xsa = False
@@ -1271,6 +1279,8 @@ class GPT(nn.Module):
         for block in self.front_blocks:
             x = self._apply_boundary_block(block, x, embed_anchor)
         core_anchor = x if self.stage_anchors_enabled else embed_anchor
+        late_core_anchor = core_anchor
+        handoff_start = self._core_handoff_start()
 
         prev_state = None
         loop_stats: list[dict[str, float]] = []
@@ -1280,15 +1290,18 @@ class GPT(nn.Module):
             pre_block = summarize_activation_stats(x_pre_block)
             block = self.core_blocks[loop_idx % self.num_core_blocks]
             block.attn.use_xsa = self._core_uses_xsa(loop_idx)
+            active_anchor = late_core_anchor if loop_idx >= handoff_start else core_anchor
             x = block(
                 x_pre_block,
-                core_anchor,
+                active_anchor,
                 self.attn_scales[loop_idx],
                 self.mlp_scales[loop_idx],
                 self.resid_mixes[loop_idx],
                 v_embed=self._get_core_ve(input_ids, loop_idx),
             )
             prev_state = x
+            if loop_idx + 1 == handoff_start:
+                late_core_anchor = x
             loop_stats.append(
                 {
                     "loop_idx": float(loop_idx),
@@ -1330,6 +1343,8 @@ class GPT(nn.Module):
         for block in self.front_blocks:
             x = self._apply_boundary_block(block, x, embed_anchor)
         core_anchor = x if self.stage_anchors_enabled else embed_anchor
+        late_core_anchor = core_anchor
+        handoff_start = self._core_handoff_start()
 
         prev_state = None
         for loop_idx in range(self.num_core_loops):
@@ -1338,9 +1353,10 @@ class GPT(nn.Module):
             x = self._prepare_core_input(x, prev_state, loop_idx)
             block = self.core_blocks[loop_idx % self.num_core_blocks]
             block.attn.use_xsa = self._core_uses_xsa(loop_idx)
+            active_anchor = late_core_anchor if loop_idx >= handoff_start else core_anchor
             x = block(
                 x,
-                core_anchor,
+                active_anchor,
                 self.attn_scales[loop_idx],
                 self.mlp_scales[loop_idx],
                 self.resid_mixes[loop_idx],
@@ -1349,6 +1365,8 @@ class GPT(nn.Module):
                 v_embed=self._get_core_ve(input_ids, loop_idx),
             )
             prev_state = x
+            if loop_idx + 1 == handoff_start:
+                late_core_anchor = x
 
         back_anchor = x if self.stage_anchors_enabled else embed_anchor
         for block in self.back_blocks:
@@ -1377,21 +1395,26 @@ class GPT(nn.Module):
         for block in self.front_blocks:
             x = self._apply_boundary_block(block, x, embed_anchor)
         core_anchor = x if self.stage_anchors_enabled else embed_anchor
+        late_core_anchor = core_anchor
+        handoff_start = self._core_handoff_start()
 
         prev_state = None
         for loop_idx in range(self.num_core_loops):
             x = self._prepare_core_input(x, prev_state, loop_idx)
             block = self.core_blocks[loop_idx % self.num_core_blocks]
             block.attn.use_xsa = self._core_uses_xsa(loop_idx)
+            active_anchor = late_core_anchor if loop_idx >= handoff_start else core_anchor
             x = block(
                 x,
-                core_anchor,
+                active_anchor,
                 self.attn_scales[loop_idx],
                 self.mlp_scales[loop_idx],
                 self.resid_mixes[loop_idx],
                 v_embed=self._get_core_ve(input_ids, loop_idx),
             )
             prev_state = x
+            if loop_idx + 1 == handoff_start:
+                late_core_anchor = x
 
         back_anchor = x if self.stage_anchors_enabled else embed_anchor
         for block in self.back_blocks:
@@ -1748,6 +1771,7 @@ def main() -> None:
             carry_enabled=args.carry_enabled,
             carry_init=args.carry_init,
             stage_anchors_enabled=args.stage_anchors_enabled,
+            core_handoff_enabled=args.core_handoff_enabled,
         )
         .to(device)
         .bfloat16()
@@ -2003,7 +2027,8 @@ def main() -> None:
     )
     log0(
         f"align:enabled={args.align_enabled} mode={args.align_mode} depth_bias={args.depth_bias_enabled} carry={args.carry_enabled} "
-        f"stage_anchors={args.stage_anchors_enabled} ve_last_n:{args.ve_last_n} xsa_last_n:{args.xsa_last_n} loop_stats={args.collect_loop_stats}"
+        f"stage_anchors={args.stage_anchors_enabled} core_handoff={args.core_handoff_enabled} "
+        f"ve_last_n:{args.ve_last_n} xsa_last_n:{args.xsa_last_n} loop_stats={args.collect_loop_stats}"
     )
     log0(f"seed:{args.seed}")
 
