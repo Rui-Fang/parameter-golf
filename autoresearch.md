@@ -70,7 +70,7 @@ git pull --ff-only
 git checkout -b autoresearch/<tag>
 test -d ./data/datasets/fineweb10B_sp1024
 test -f ./data/tokenizers/fineweb_1024_bpe.model
-printf 'commit\tval_bpb\tmemory_gb\tartifact_mb\tstatus\tdescription\n' > results.tsv
+printf 'commit\tval_bpb\tval_bpb_1000\tmemory_gb\tartifact_mb\tstatus\tdescription\n' > results.tsv
 ```
 
 ## What You Can Change
@@ -99,14 +99,16 @@ RUN_ID=<run_id> torchrun --standalone --nproc_per_node=1 train_gpt.py > logs/<ru
 
 Notes:
 
+- Use time-first run ids so logs sort chronologically, for example `20260331_014700_stageanchors`.
 - `train_gpt.py` already writes its own structured log to `logs/<RUN_ID>.txt`.
 - Redirecting stdout and stderr to `logs/<run_id>.driver.log` avoids flooding the agent context.
-- The current built-in single-GPU defaults are: `MAX_WALLCLOCK_SECONDS=4800`, `TRAIN_BATCH_TOKENS=1048576`, `GRAD_ACCUM_STEPS=2`, `NUM_FRONT_BLOCKS=1`, `NUM_CORE_BLOCKS=3`, `NUM_CORE_LOOPS=3`, `NUM_BACK_BLOCKS=1`, `QAT_ENABLED=1`, `QAT_MODE=shared_early`, `VE_LAST_N=2`, `XSA_LAST_N=2`, `COLLECT_LOOP_STATS=1`.
+- The current built-in single-GPU defaults are: `MAX_WALLCLOCK_SECONDS=1800`, `TRAIN_BATCH_TOKENS=1048576`, `GRAD_ACCUM_STEPS=2`, `NUM_FRONT_BLOCKS=1`, `NUM_CORE_BLOCKS=3`, `NUM_CORE_LOOPS=3`, `NUM_BACK_BLOCKS=1`, `QAT_ENABLED=1`, `QAT_MODE=shared_early`, `VE_LAST_N=2`, `XSA_LAST_N=2`, `COLLECT_LOOP_STATS=1`.
 
 Baseline command example:
 
 ```bash
-RUN_ID=baseline_$(date +%Y%m%d_%H%M%S) torchrun --standalone --nproc_per_node=1 train_gpt.py > logs/baseline.driver.log 2>&1
+RUN_ID=$(date +%Y%m%d_%H%M%S)_baseline
+torchrun --standalone --nproc_per_node=1 train_gpt.py > logs/${RUN_ID}.driver.log 2>&1
 ```
 
 ## Metrics To Track
@@ -120,6 +122,7 @@ Important supporting metrics:
 - `peak memory allocated: ... reserved: ...`
 - `artifact_check:start ... total_bytes:... limit:16000000 ...`
 - `Total submission size int8+zlib: ... bytes`
+- `step:1000/20000 val_loss:... val_bpb:...`
 - `architecture:planc ...`
 - `align:enabled=...`
 - `local_batch_tokens:...`
@@ -131,7 +134,7 @@ Optional metric:
 Useful extraction commands:
 
 ```bash
-grep -E "final_int8_zlib_roundtrip_exact|final_ttt_sliding|peak memory allocated:|artifact_check:start|Total submission size int8\+zlib:" logs/<run_id>.txt
+grep -E "step:1000/20000 val_loss|final_int8_zlib_roundtrip_exact|final_ttt_sliding|peak memory allocated:|artifact_check:start|Total submission size int8\+zlib:" logs/<run_id>.txt
 ```
 
 If that returns no final score line, the run failed. Inspect the tail:
@@ -154,26 +157,27 @@ When an experiment completes, append a row to `results.tsv`. Use tab separation,
 Header:
 
 ```tsv
-commit	val_bpb	memory_gb	artifact_mb	status	description
+commit	val_bpb	val_bpb_1000	memory_gb	artifact_mb	status	description
 ```
 
 Columns:
 
 1. Short git commit hash, 7 chars.
 2. Primary `final_int8_zlib_roundtrip_exact` `val_bpb`, or `0.000000` for crashes.
-3. Peak allocated memory in GB, rounded to one decimal place, or `0.0` for crashes.
-4. Final `int8+zlib` submission size in decimal MB, rounded to three decimals, or `0.000` for crashes.
-5. Status: `keep`, `discard`, or `crash`.
-6. Short description of the hypothesis tested.
+3. `step:1000/20000 ... val_bpb`, or `0.0000` if the run crashed or never reached step 1000.
+4. Peak allocated memory in GB, rounded to one decimal place, or `0.0` for crashes.
+5. Final `int8+zlib` submission size in decimal MB, rounded to three decimals, or `0.000` for crashes.
+6. Status: `keep`, `discard`, or `crash`.
+7. Short description of the hypothesis tested.
 
 Example:
 
 ```tsv
-commit	val_bpb	memory_gb	artifact_mb	status	description
-a1b2c3d	1.132450	42.8	15.612	keep	baseline planc local 1gpu
-b2c3d4e	1.129980	43.1	15.744	keep	shift QAT earlier for shared core
-c3d4e5f	1.131700	45.6	15.731	discard	enable affine aligner on all loops
-d4e5f6g	0.000000	0.0	0.000	crash	increase core loops to 6 caused OOM
+commit	val_bpb	val_bpb_1000	memory_gb	artifact_mb	status	description
+a1b2c3d	1.132450	1.2841	42.8	15.612	keep	baseline planc local 1gpu
+b2c3d4e	1.129980	1.2817	43.1	15.744	keep	shift QAT earlier for shared core
+c3d4e5f	1.131700	1.2839	45.6	15.731	discard	enable affine aligner on all loops
+d4e5f6g	0.000000	0.0000	0.0	0.000	crash	increase core loops to 6 caused OOM
 ```
 
 ## High-Value Experiment Axes
@@ -213,8 +217,9 @@ git rev-parse --short HEAD
 git add train_gpt.py
 git commit -m "exp: <short hypothesis>"
 mkdir -p logs
-RUN_ID=<run_id> torchrun --standalone --nproc_per_node=1 train_gpt.py > logs/<run_id>.driver.log 2>&1
-grep -E "final_int8_zlib_roundtrip_exact|final_ttt_sliding|peak memory allocated:|artifact_check:start|Total submission size int8\+zlib:" logs/<run_id>.txt
+RUN_ID=$(date +%Y%m%d_%H%M%S)_<hypothesis>
+torchrun --standalone --nproc_per_node=1 train_gpt.py > logs/${RUN_ID}.driver.log 2>&1
+grep -E "step:1000/20000 val_loss|final_int8_zlib_roundtrip_exact|final_ttt_sliding|peak memory allocated:|artifact_check:start|Total submission size int8\+zlib:" logs/${RUN_ID}.txt
 ```
 
 If the run is a loser, reset the code state back to the best kept commit on the autoresearch branch before starting the next idea.

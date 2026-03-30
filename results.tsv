@@ -1,0 +1,13 @@
+commit	val_bpb	val_bpb_1000	memory_gb	artifact_mb	status	description
+5aebabe	1.44182798	1.3160	86.9	16.761	discard	baseline defaults; over 16MB artifact
+28f95b3	1.81837740	1.3115	86.8	12.180	keep	20min cap + smaller bigram hash defaults
+95a0cfb	1.83539095	1.3056	86.9	12.832	discard	restore larger bigram under 20min cap
+e6b1cab	1.59639946	1.3132	86.8	13.688	keep	20min cap with warmdown_iters=600
+7e4b766	0.000000	0.0000	0.0	0.000	crash	interrupted; pivot to structural optimization
+2fbe3ff	0.000000	0.0000	0.0	0.000	crash	VE enabled caused v_embed dtype mismatch in loop_stats
+c5ae844	1.58731158	1.3096	88.1	13.868	keep	enable VE + dtype-safe v_embed path
+c977611	1.58088609	1.3093	88.1	13.805	keep	affine loop aligner with VE enabled
+3dbdbb2	1.62057343	1.3270	88.0	11.487	discard	reduce core block bank to 2
+c2e34c9	1.56685275	1.3104	88.1	13.848	keep	disable cross-loop carry branch
+ef0fc46	1.58733650	1.3102	88.1	13.816	discard	disable loop depth bias module
+9abbe89	1.50251827	1.3184	87.1	15.655	keep	30min cap with stage-specific front/core/back anchors

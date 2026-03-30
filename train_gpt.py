@@ -22,6 +22,10 @@ from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 
+def _default_run_id() -> str:
+    return f"{time.strftime('%Y%m%d_%H%M%S')}_run_{uuid.uuid4().hex[:8]}"
+
+
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -29,7 +33,7 @@ class Hyperparameters:
     tokenizer_path = os.environ.get(
         "TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model"
     )
-    run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
+    run_id = os.environ.get("RUN_ID", _default_run_id())
     seed = int(os.environ.get("SEED", 1337))
 
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
@@ -37,11 +41,11 @@ class Hyperparameters:
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 600))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 1_048_576))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
-    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 2400.0))
+    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 1800.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -67,20 +71,21 @@ class Hyperparameters:
     qat_core_start_frac = float(os.environ.get("QAT_CORE_START_FRAC", 0.05))
     qat_boundary_start_frac = float(os.environ.get("QAT_BOUNDARY_START_FRAC", 0.20))
     qat_aux_start_frac = float(os.environ.get("QAT_AUX_START_FRAC", 1.00))
-    bigram_buckets = int(os.environ.get("BIGRAM_BUCKETS", 10240))
-    bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
+    bigram_buckets = int(os.environ.get("BIGRAM_BUCKETS", 8192))
+    bigram_dim = int(os.environ.get("BIGRAM_DIM", 64))
     embed_bottleneck = int(os.environ.get("EMBED_BOTTLENECK", 0))
-    ve_enabled = bool(int(os.environ.get("VE_ENABLED", "0")))
+    ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
     ve_last_n = int(os.environ.get("VE_LAST_N", 2))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 2))
     align_enabled = bool(int(os.environ.get("ALIGN_ENABLED", "1")))
-    align_mode = os.environ.get("ALIGN_MODE", "bias")
+    align_mode = os.environ.get("ALIGN_MODE", "affine")
     align_scale_clamp = float(os.environ.get("ALIGN_SCALE_CLAMP", 0.125))
     align_mix_init = float(os.environ.get("ALIGN_MIX_INIT", 0.0))
     depth_bias_enabled = bool(int(os.environ.get("DEPTH_BIAS_ENABLED", "1")))
-    carry_enabled = bool(int(os.environ.get("CARRY_ENABLED", "1")))
+    carry_enabled = bool(int(os.environ.get("CARRY_ENABLED", "0")))
     carry_init = float(os.environ.get("CARRY_INIT", 0.05))
+    stage_anchors_enabled = bool(int(os.environ.get("STAGE_ANCHORS_ENABLED", "1")))
     collect_loop_stats = bool(int(os.environ.get("COLLECT_LOOP_STATS", "1")))
     loop_stats_every = int(os.environ.get("LOOP_STATS_EVERY", 200))
 
@@ -1011,6 +1016,7 @@ class Block(nn.Module):
         qd = q_delta_fn(n) if q_delta_fn is not None else None
         vd = v_delta_fn(n) if v_delta_fn is not None else None
         if v_embed is not None:
+            v_embed = v_embed.to(dtype=n.dtype)
             vd = (vd + v_embed) if vd is not None else v_embed
         attn_out = self.attn(n, qd, vd)
         x = x + attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
@@ -1036,8 +1042,8 @@ class GPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         use_smear_gate: bool = True,
-        bigram_buckets: int = 10240,
-        bigram_dim: int = 128,
+        bigram_buckets: int = 8192,
+        bigram_dim: int = 64,
         embed_bottleneck: int = 0,
         ve_enabled: bool = False,
         ve_dim: int = 128,
@@ -1050,6 +1056,7 @@ class GPT(nn.Module):
         depth_bias_enabled: bool = True,
         carry_enabled: bool = True,
         carry_init: float = 0.05,
+        stage_anchors_enabled: bool = True,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1142,6 +1149,7 @@ class GPT(nn.Module):
             if carry_enabled
             else None
         )
+        self.stage_anchors_enabled = stage_anchors_enabled
         self.attn_scales = nn.Parameter(
             torch.ones(num_core_loops, model_dim, dtype=torch.float32)
         )
@@ -1259,9 +1267,10 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         if self.smear is not None:
             x = self.smear(x)
-        x0 = x
+        embed_anchor = x
         for block in self.front_blocks:
-            x = self._apply_boundary_block(block, x, x0)
+            x = self._apply_boundary_block(block, x, embed_anchor)
+        core_anchor = x if self.stage_anchors_enabled else embed_anchor
 
         prev_state = None
         loop_stats: list[dict[str, float]] = []
@@ -1273,7 +1282,7 @@ class GPT(nn.Module):
             block.attn.use_xsa = self._core_uses_xsa(loop_idx)
             x = block(
                 x_pre_block,
-                x0,
+                core_anchor,
                 self.attn_scales[loop_idx],
                 self.mlp_scales[loop_idx],
                 self.resid_mixes[loop_idx],
@@ -1317,9 +1326,10 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         if self.smear is not None:
             x = self.smear(x)
-        x0 = x
+        embed_anchor = x
         for block in self.front_blocks:
-            x = self._apply_boundary_block(block, x, x0)
+            x = self._apply_boundary_block(block, x, embed_anchor)
+        core_anchor = x if self.stage_anchors_enabled else embed_anchor
 
         prev_state = None
         for loop_idx in range(self.num_core_loops):
@@ -1330,7 +1340,7 @@ class GPT(nn.Module):
             block.attn.use_xsa = self._core_uses_xsa(loop_idx)
             x = block(
                 x,
-                x0,
+                core_anchor,
                 self.attn_scales[loop_idx],
                 self.mlp_scales[loop_idx],
                 self.resid_mixes[loop_idx],
@@ -1340,8 +1350,9 @@ class GPT(nn.Module):
             )
             prev_state = x
 
+        back_anchor = x if self.stage_anchors_enabled else embed_anchor
         for block in self.back_blocks:
-            x = self._apply_boundary_block(block, x, x0)
+            x = self._apply_boundary_block(block, x, back_anchor)
         x = self.final_norm(x)
         logits = self._logits(x)
         logits = logits + (lora.lm_head_lora(x) if lora else 0)
@@ -1362,9 +1373,10 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         if self.smear is not None:
             x = self.smear(x)
-        x0 = x
+        embed_anchor = x
         for block in self.front_blocks:
-            x = self._apply_boundary_block(block, x, x0)
+            x = self._apply_boundary_block(block, x, embed_anchor)
+        core_anchor = x if self.stage_anchors_enabled else embed_anchor
 
         prev_state = None
         for loop_idx in range(self.num_core_loops):
@@ -1373,7 +1385,7 @@ class GPT(nn.Module):
             block.attn.use_xsa = self._core_uses_xsa(loop_idx)
             x = block(
                 x,
-                x0,
+                core_anchor,
                 self.attn_scales[loop_idx],
                 self.mlp_scales[loop_idx],
                 self.resid_mixes[loop_idx],
@@ -1381,8 +1393,9 @@ class GPT(nn.Module):
             )
             prev_state = x
 
+        back_anchor = x if self.stage_anchors_enabled else embed_anchor
         for block in self.back_blocks:
-            x = self._apply_boundary_block(block, x, x0)
+            x = self._apply_boundary_block(block, x, back_anchor)
         x = self.final_norm(x)
         return self._logits(x)
 
@@ -1734,6 +1747,7 @@ def main() -> None:
             depth_bias_enabled=args.depth_bias_enabled,
             carry_enabled=args.carry_enabled,
             carry_init=args.carry_init,
+            stage_anchors_enabled=args.stage_anchors_enabled,
         )
         .to(device)
         .bfloat16()
@@ -1989,7 +2003,7 @@ def main() -> None:
     )
     log0(
         f"align:enabled={args.align_enabled} mode={args.align_mode} depth_bias={args.depth_bias_enabled} carry={args.carry_enabled} "
-        f"ve_last_n:{args.ve_last_n} xsa_last_n:{args.xsa_last_n} loop_stats={args.collect_loop_stats}"
+        f"stage_anchors={args.stage_anchors_enabled} ve_last_n:{args.ve_last_n} xsa_last_n:{args.xsa_last_n} loop_stats={args.collect_loop_stats}"
     )
     log0(f"seed:{args.seed}")
 
