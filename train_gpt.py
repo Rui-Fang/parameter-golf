@@ -64,7 +64,7 @@ class Hyperparameters:
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     use_smear_gate = bool(int(os.environ.get("USE_SMEAR_GATE", "1")))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))
-    qat_mode = os.environ.get("QAT_MODE", "shared_early")
+    qat_mode = os.environ.get("QAT_MODE", "step0")
     qat_bits = int(os.environ.get("QAT_BITS", 6))
     qat_mlp_bits = int(os.environ.get("QAT_MLP_BITS", 0))
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
